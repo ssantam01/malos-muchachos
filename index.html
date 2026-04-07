@@ -78,6 +78,7 @@ function setTiposCheckboxes(tipoStr) {
 
 // ── AUTH STATE ────────────────────────────────────────────────────
 sb.auth.onAuthStateChange(async (_event, session) => {
+  console.log("onAuthStateChange fired:", _event, session?.user?.email);
   if (session?.user) {
     currentUser = session.user;
     isAdmin     = currentUser.email === ADMIN_EMAIL;
@@ -85,9 +86,11 @@ sb.auth.onAuthStateChange(async (_event, session) => {
       const { data } = await sb.from("perfiles").select("*").eq("id", currentUser.id).single();
       currentProfile = data || {};
     } catch(_) { currentProfile = {}; }
+    console.log("calling showApp, isAdmin:", isAdmin);
     showApp();
   } else {
     currentUser = null; currentProfile = null; isAdmin = false;
+    console.log("calling showAuth");
     showAuth();
   }
 });
@@ -114,9 +117,10 @@ async function handleLogin() {
   const email=g("l-email"), password=g("l-password");
   if (!email||!password) return authErr("Complete email y contraseña.");
   setBusy(true);
+  console.log("attempting login for:", email);
   const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  console.log("login result - error:", error, "user:", data?.user?.email);
   if (error) { setBusy(false); authErr(sbErr(error.message)); return; }
-  // Forzar carga manual por si onAuthStateChange no dispara
   if (data?.user) {
     currentUser = data.user;
     isAdmin     = currentUser.email === ADMIN_EMAIL;
@@ -124,6 +128,7 @@ async function handleLogin() {
       const { data: perfil } = await sb.from("perfiles").select("*").eq("id", currentUser.id).single();
       currentProfile = perfil || {};
     } catch(_) { currentProfile = {}; }
+    console.log("manually calling showApp");
     showApp();
   }
 }
