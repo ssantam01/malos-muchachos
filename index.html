@@ -557,12 +557,17 @@ function sbErr(msg) {
 }
 function showAuth(){ byId("screen-auth").style.display="flex"; byId("screen-app").style.display="none"; }
 function showApp(){
+  console.log("showApp called");
   byId("screen-auth").style.display="none"; byId("screen-app").style.display="block";
   const nom=currentProfile?`${currentProfile.nombre||""} ${currentProfile.apellido||""}`.trim()||currentUser.email:currentUser.email;
+  console.log("nom:", nom);
   byId("u-name").textContent=nom; byId("u-emp").textContent=currentProfile?.empresa||"";
   byId("nav-admin").style.display=isAdmin?"inline-block":"none";
+  console.log("calling showSection archivo");
   showSection("archivo");
+  console.log("calling refrescarTabla");
   refrescarTabla();
+  console.log("showApp done");
 }
 function showAuthTab(tab){
   byId("auth-error").style.display="none";
