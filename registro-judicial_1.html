@@ -1,0 +1,951 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Registro de Litigantes Maliciosos</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+<script>
+const SUPABASE_URL  = "https://ofvhgmatpemposqfcyto.supabase.co";
+const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9mdmhnbWF0cGVtcG9zcWZjeXRvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU1NTgwMTUsImV4cCI6MjA5MTEzNDAxNX0.DVMfPoyAssepm5k9gpeujHmveE3YUWF80Tptnrz17jo";
+const ADMIN_EMAIL   = "simonsantamaria.cv@gmail.com";
+const LOGO_BASE64   = null;
+const BUCKET        = "adjuntos";
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+
+// ── ESTADO ────────────────────────────────────────────────────────
+let currentUser    = null;
+let currentProfile = null;
+let isAdmin        = false;
+let activeRecord   = null;
+let activeAdjuntos = [];
+let editingId      = null; // null = nuevo, uuid = editar
+
+// ── HELPERS ───────────────────────────────────────────────────────
+const g    = id => (document.getElementById(id)?.value || "").trim();
+const byId = id => document.getElementById(id);
+const x    = s  => String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const loadingRow = c => `<tr><td colspan="${c}" class="cell-info">Cargando...</td></tr>`;
+const emptyRow   = (c,m) => `<tr><td colspan="${c}" class="cell-info">${m}</td></tr>`;
+
+const TIPO_LBL = {"juicio-falso":"Juicio laboral fraudulento","testigo-falso":"Presentación de testigos falsos","ambos":"Juicio fraudulento + testigos falsos"};
+const TIPO_SHORT = {"juicio-falso":"Juicio fraudulento","testigo-falso":"Testigos falsos","ambos":"Ambos"};
+const TIPO_CLS  = {"juicio-falso":"badge-red","testigo-falso":"badge-gold","ambos":"badge-dim"};
+
+// ── AUTH STATE ────────────────────────────────────────────────────
+sb.auth.onAuthStateChange(async (_event, session) => {
+  if (session?.user) {
+    currentUser = session.user;
+    isAdmin     = currentUser.email === ADMIN_EMAIL;
+    try {
+      const { data } = await sb.from("perfiles").select("*").eq("id", currentUser.id).single();
+      currentProfile = data || {};
+    } catch(_) { currentProfile = {}; }
+    showApp();
+  } else {
+    currentUser = null; currentProfile = null; isAdmin = false;
+    showAuth();
+  }
+});
+
+// ── REGISTRO ──────────────────────────────────────────────────────
+async function handleRegister() {
+  const nombre=g("r-nombre"),apellido=g("r-apellido"),email=g("r-email"),
+        password=g("r-password"),empresa=g("r-empresa"),cargo=g("r-cargo");
+  if (!nombre||!apellido||!email||!password||!empresa||!cargo) return authErr("Complete todos los campos.");
+  if (password.length<6) return authErr("La contraseña debe tener al menos 6 caracteres.");
+  setBusy(true);
+  const { data, error } = await sb.auth.signUp({ email, password });
+  if (error) { setBusy(false); return authErr(sbErr(error.message)); }
+  await sb.from("perfiles").insert({ id:data.user.id, nombre, apellido, empresa, cargo, email });
+}
+
+async function handleLogin() {
+  const email=g("l-email"), password=g("l-password");
+  if (!email||!password) return authErr("Complete email y contraseña.");
+  setBusy(true);
+  const { error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) { setBusy(false); authErr(sbErr(error.message)); }
+}
+
+async function handleLogout() { await sb.auth.signOut(); }
+
+// ── AUDITORÍA ─────────────────────────────────────────────────────
+async function logAcceso(reg) {
+  if (!currentUser) return;
+  await sb.from("auditoria").insert({
+    uid:currentUser.id, email:currentUser.email,
+    nombre:`${currentProfile?.nombre||""} ${currentProfile?.apellido||""}`.trim(),
+    empresa:currentProfile?.empresa||"", cargo:currentProfile?.cargo||"",
+    expediente_id:reg.id, persona:`${reg.apellido}, ${reg.nombre}`, cuil:reg.cuil,
+  });
+}
+
+// ── EXPEDIENTES — CARGAR ──────────────────────────────────────────
+async function cargarExpedientes() {
+  const { data, error } = await sb.from("expedientes").select("*").order("created_at", { ascending:false });
+  if (error) { console.error(error); return []; }
+  return data || [];
+}
+
+let REGISTROS = [];
+
+async function refrescarTabla() {
+  REGISTROS = await cargarExpedientes();
+  renderTabla(REGISTROS);
+}
+
+// ── EXPEDIENTES — GUARDAR (admin) ─────────────────────────────────
+async function guardarExpediente() {
+  const apellido    = g("e-apellido");
+  const nombre      = g("e-nombre");
+  const cuil        = g("e-cuil");
+  const dni         = g("e-dni");
+  const tipo        = g("e-tipo");
+  const anio        = parseInt(g("e-anio"));
+  const nro         = g("e-nro");
+  const jurisdiccion= g("e-jurisdiccion");
+  const tribunal    = g("e-tribunal");
+  const descripcion = g("e-descripcion");
+
+  if (!apellido||!nombre||!cuil||!tipo||!anio) {
+    mostrarToast("Completá los campos obligatorios (*).", "error"); return;
+  }
+
+  const btnGuardar = byId("btn-guardar-exp");
+  btnGuardar.disabled = true; btnGuardar.textContent = "Guardando...";
+
+  let expId = editingId;
+
+  if (editingId) {
+    // Editar
+    const { error } = await sb.from("expedientes").update(
+      { apellido,nombre,cuil,dni,tipo,anio,nro,jurisdiccion,tribunal,descripcion }
+    ).eq("id", editingId);
+    if (error) { mostrarToast("Error al guardar: "+error.message,"error"); btnGuardar.disabled=false; btnGuardar.textContent="Guardar expediente"; return; }
+  } else {
+    // Nuevo
+    const { data, error } = await sb.from("expedientes").insert(
+      { apellido,nombre,cuil,dni,tipo,anio,nro,jurisdiccion,tribunal,descripcion }
+    ).select().single();
+    if (error) { mostrarToast("Error al guardar: "+error.message,"error"); btnGuardar.disabled=false; btnGuardar.textContent="Guardar expediente"; return; }
+    expId = data.id;
+  }
+
+  // Subir archivos adjuntos nuevos
+  const fileInput = byId("e-adjuntos");
+  if (fileInput.files.length > 0) {
+    for (const file of fileInput.files) {
+      const ruta = `${expId}/${Date.now()}_${file.name.replace(/\s+/g,"_")}`;
+      const { error: upErr } = await sb.storage.from(BUCKET).upload(ruta, file, { upsert:true });
+      if (!upErr) {
+        await sb.from("adjuntos").insert({ expediente_id:expId, nombre:file.name, ruta, tipo_archivo:file.type });
+      }
+    }
+  }
+
+  mostrarToast(editingId ? "Expediente actualizado." : "Expediente creado correctamente.", "ok");
+  cerrarFormExpediente();
+  await refrescarTabla();
+  btnGuardar.disabled=false; btnGuardar.textContent="Guardar expediente";
+}
+
+// ── EXPEDIENTES — ELIMINAR (admin) ────────────────────────────────
+async function eliminarExpediente(id) {
+  if (!confirm("¿Eliminar este expediente? Esta acción no se puede deshacer.")) return;
+  // Eliminar archivos del storage
+  const { data: adjs } = await sb.from("adjuntos").select("ruta").eq("expediente_id", id);
+  if (adjs?.length) {
+    await sb.storage.from(BUCKET).remove(adjs.map(a=>a.ruta));
+  }
+  await sb.from("expedientes").delete().eq("id", id);
+  mostrarToast("Expediente eliminado.", "ok");
+  await refrescarTabla();
+}
+
+// ── FORMULARIO EXPEDIENTE ─────────────────────────────────────────
+async function abrirFormExpediente(reg = null) {
+  editingId = reg ? reg.id : null;
+  byId("form-exp-titulo").textContent = reg ? "Editar expediente" : "Nuevo expediente";
+  byId("btn-guardar-exp").textContent = "Guardar expediente";
+
+  // Limpiar
+  ["e-apellido","e-nombre","e-cuil","e-dni","e-anio","e-nro","e-tribunal","e-descripcion"].forEach(id=>{
+    const el=byId(id); if(el) el.value="";
+  });
+  byId("e-tipo").value="";
+  byId("e-jurisdiccion").value="";
+  byId("e-adjuntos").value="";
+  byId("adj-existentes").innerHTML="";
+
+  if (reg) {
+    byId("e-apellido").value    = reg.apellido||"";
+    byId("e-nombre").value      = reg.nombre||"";
+    byId("e-cuil").value        = reg.cuil||"";
+    byId("e-dni").value         = reg.dni||"";
+    byId("e-tipo").value        = reg.tipo||"";
+    byId("e-anio").value        = reg.anio||"";
+    byId("e-nro").value         = reg.nro||"";
+    byId("e-jurisdiccion").value= reg.jurisdiccion||"";
+    byId("e-tribunal").value    = reg.tribunal||"";
+    byId("e-descripcion").value = reg.descripcion||"";
+
+    // Cargar adjuntos existentes
+    const { data: adjs } = await sb.from("adjuntos").select("*").eq("expediente_id", reg.id);
+    if (adjs?.length) {
+      const cont = byId("adj-existentes");
+      cont.innerHTML = `<div class="adj-label">Archivos ya adjuntos:</div>`;
+      adjs.forEach(a => {
+        const url = sb.storage.from(BUCKET).getPublicUrl(a.ruta).data.publicUrl;
+        cont.innerHTML += `<div class="adj-item">
+          <a href="${url}" target="_blank" class="adj-link">📎 ${x(a.nombre)}</a>
+          <button class="adj-del" onclick="eliminarAdjunto('${a.id}','${a.ruta}')">✕</button>
+        </div>`;
+      });
+    }
+  }
+
+  byId("modal-form-exp").classList.add("open");
+  document.body.style.overflow = "hidden";
+}
+
+async function eliminarAdjunto(adjId, ruta) {
+  await sb.storage.from(BUCKET).remove([ruta]);
+  await sb.from("adjuntos").delete().eq("id", adjId);
+  // Refrescar lista
+  const reg = REGISTROS.find(r=>r.id===editingId);
+  if (reg) abrirFormExpediente(reg);
+}
+
+function cerrarFormExpediente() {
+  byId("modal-form-exp").classList.remove("open");
+  document.body.style.overflow="";
+  editingId=null;
+}
+
+// ── MODAL DETALLE ─────────────────────────────────────────────────
+async function abrirModal(r) {
+  await logAcceso(r);
+  activeRecord = r;
+
+  const s=(id,v)=>{ const e=byId(id); if(e) e.textContent=v||"—"; };
+  s("m-nombre",  `${r.apellido}, ${r.nombre}`);
+  s("m-cuil-h",  `CUIL ${r.cuil}`);
+  s("m-cuil",    r.cuil);   s("m-dni",  r.dni);
+  s("m-tipo",    TIPO_LBL[r.tipo]); s("m-anio", r.anio);
+  s("m-nro",     r.nro);    s("m-jur",  r.jurisdiccion);
+  s("m-trib",    r.tribunal); s("m-desc", r.descripcion);
+
+  // Cargar adjuntos
+  activeAdjuntos = [];
+  const adjCont = byId("m-adjuntos-lista");
+  adjCont.innerHTML = `<span class="adj-loading">Cargando archivos...</span>`;
+  const { data: adjs } = await sb.from("adjuntos").select("*").eq("expediente_id", r.id);
+  activeAdjuntos = adjs || [];
+
+  if (!activeAdjuntos.length) {
+    adjCont.innerHTML = `<span class="adj-empty">Sin archivos adjuntos.</span>`;
+  } else {
+    adjCont.innerHTML = "";
+    activeAdjuntos.forEach(a => {
+      const url = sb.storage.from(BUCKET).getPublicUrl(a.ruta).data.publicUrl;
+      const esImagen = a.tipo_archivo?.startsWith("image/");
+      adjCont.innerHTML += `<a href="${url}" target="_blank" class="adj-chip">
+        ${esImagen ? "🖼" : "📄"} ${x(a.nombre)}
+      </a>`;
+    });
+  }
+
+  // Botones admin en modal
+  byId("modal-admin-btns").style.display = isAdmin ? "flex" : "none";
+  byId("btn-pdf").disabled=false; byId("btn-pdf").textContent="Descargar PDF";
+  byId("modal").classList.add("open");
+  document.body.style.overflow="hidden";
+}
+
+function cerrarModal(e) {
+  if (!e||e.target===byId("modal-overlay")||e.currentTarget?.id==="btn-modal-close") {
+    byId("modal").classList.remove("open");
+    document.body.style.overflow="";
+    activeRecord=null; activeAdjuntos=[];
+  }
+}
+
+document.addEventListener("keydown", e => { if(e.key==="Escape") { cerrarModal(); cerrarFormExpediente(); } });
+
+// ── TABLA ─────────────────────────────────────────────────────────
+function filtrar() {
+  const n=g("s-nombre").toLowerCase(), a=g("s-apellido").toLowerCase(), c=g("s-cuil").replace(/\D/g,"");
+  renderTabla(REGISTROS.filter(r=>
+    (!n||r.nombre.toLowerCase().includes(n))&&
+    (!a||r.apellido.toLowerCase().includes(a))&&
+    (!c||r.cuil.replace(/\D/g,"").includes(c))
+  ));
+}
+
+function limpiar() {
+  ["s-nombre","s-apellido","s-cuil"].forEach(id=>{if(byId(id))byId(id).value="";});
+  renderTabla(REGISTROS);
+}
+
+function renderTabla(data) {
+  const tb=byId("tabla-body"), emp=byId("empty-state");
+  byId("count-num").textContent=data.length;
+  tb.innerHTML="";
+  if (!data.length) { emp.style.display="block"; return; }
+  emp.style.display="none";
+  data.forEach(r=>{
+    const tr=document.createElement("tr");
+    tr.innerHTML=`
+      <td class="td-n">${x(r.apellido)}, ${x(r.nombre)}</td>
+      <td class="mono">${x(r.cuil)}</td>
+      <td><span class="badge ${TIPO_CLS[r.tipo]}">${TIPO_SHORT[r.tipo]||r.tipo}</span></td>
+      <td>${r.anio}</td>
+      <td>${x(r.jurisdiccion||"")}</td>
+      <td class="mono">${x(r.nro||"")}` +
+      (isAdmin ? `</td><td class="td-actions">
+        <button class="btn-mini" onclick="event.stopPropagation();editarExp('${r.id}')">Editar</button>
+        <button class="btn-mini btn-mini-red" onclick="event.stopPropagation();eliminarExpediente('${r.id}')">Eliminar</button>
+      </td>` : `</td>`) + ``;
+    tr.addEventListener("click", ()=>abrirModal(r));
+    tb.appendChild(tr);
+  });
+}
+
+async function editarExp(id) {
+  const reg = REGISTROS.find(r=>r.id===id);
+  if (reg) abrirFormExpediente(reg);
+}
+
+// ── ADMIN: USUARIOS y AUDITORÍA ───────────────────────────────────
+async function loadUsuarios() {
+  setAdminTab("usuarios");
+  const el=byId("t-usuarios"); el.innerHTML=loadingRow(6);
+  const { data,error } = await sb.from("perfiles").select("*").order("created_at",{ascending:false});
+  if (error||!data?.length) { el.innerHTML=emptyRow(6,error?"Error al cargar.":"Sin usuarios."); return; }
+  el.innerHTML="";
+  data.forEach(u=>{
+    const f=u.created_at?new Date(u.created_at).toLocaleDateString("es-AR"):"—";
+    el.innerHTML+=`<tr>
+      <td class="td-n">${x(u.apellido)}, ${x(u.nombre)}</td>
+      <td class="mono">${x(u.email||"")}</td>
+      <td>${x(u.empresa)}</td><td>${x(u.cargo)}</td>
+      <td class="mono">${f}</td>
+      <td><button class="btn-mini" onclick="loadAuditUser('${u.id}','${x(u.apellido+', '+u.nombre)}')">Ver accesos</button></td>
+    </tr>`;
+  });
+}
+
+async function loadAuditoria() {
+  setAdminTab("auditoria");
+  byId("audit-titulo").textContent="Todos los accesos";
+  const { data,error } = await sb.from("auditoria").select("*").order("created_at",{ascending:false});
+  renderAudit(data,error);
+}
+
+async function loadAuditUser(uid,nombre) {
+  setAdminTab("auditoria");
+  byId("audit-titulo").textContent=`Accesos de: ${nombre}`;
+  const { data,error } = await sb.from("auditoria").select("*").eq("uid",uid).order("created_at",{ascending:false});
+  renderAudit(data,error);
+}
+
+function renderAudit(data,error) {
+  const el=byId("t-auditoria");
+  if (error||!data?.length) { el.innerHTML=emptyRow(6,error?"Error al cargar.":"Sin accesos."); return; }
+  el.innerHTML="";
+  data.forEach(a=>{
+    const f=a.created_at?new Date(a.created_at).toLocaleString("es-AR"):"—";
+    el.innerHTML+=`<tr>
+      <td class="td-n">${x(a.nombre)}</td><td class="mono">${x(a.email)}</td>
+      <td>${x(a.empresa)}</td><td>${x(a.persona)}</td>
+      <td class="mono">${x(a.cuil)}</td><td class="mono">${f}</td>
+    </tr>`;
+  });
+}
+
+function setAdminTab(sec) {
+  byId("panel-usuarios").style.display  = sec==="usuarios"  ?"block":"none";
+  byId("panel-auditoria").style.display = sec==="auditoria" ?"block":"none";
+  document.querySelectorAll(".atab").forEach(b=>b.classList.remove("active"));
+  byId("atab-"+sec).classList.add("active");
+}
+
+// ── PDF ───────────────────────────────────────────────────────────
+async function generarPDF() {
+  const r=activeRecord; if (!r) return;
+  const btn=byId("btn-pdf");
+  btn.disabled=true; btn.textContent="Generando...";
+
+  const { jsPDF } = window.jspdf;
+  const doc=new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
+  const W=210,H=297,ML=20,MR=20,CW=170;
+  const INK=[13,13,15],GOLD=[181,134,40],RED=[160,40,35],MID=[100,96,110],LIGHT=[200,196,188],PAPER=[250,249,245];
+
+  doc.setFillColor(...PAPER); doc.rect(0,0,W,H,"F");
+  if (LOGO_BASE64) { try { doc.addImage(LOGO_BASE64,"PNG",W-MR-35,14,35,18,undefined,"FAST"); } catch(_){watermark(doc,W,H);} }
+  else { watermark(doc,W,H); }
+
+  doc.setDrawColor(...LIGHT); doc.setLineWidth(0.4); doc.rect(12,12,W-24,H-24);
+  doc.setFillColor(...INK); doc.rect(12,12,W-24,28,"F");
+  doc.setDrawColor(...GOLD); doc.setLineWidth(0.8); doc.line(12,40,W-12,40);
+  doc.setTextColor(230,228,220); doc.setFont("helvetica","bold"); doc.setFontSize(13);
+  doc.text("REGISTRO DE LITIGANTES MALICIOSOS",ML+2,28);
+  doc.setFont("helvetica","normal"); doc.setFontSize(7); doc.setTextColor(...LIGHT);
+  doc.text("REPORTE DE EXPEDIENTE — DOCUMENTO GENERADO AUTOMÁTICAMENTE",ML+2,35);
+  const ahora=new Date();
+  doc.text(`${ahora.toLocaleDateString("es-AR")}  ${ahora.toLocaleTimeString("es-AR",{hour:"2-digit",minute:"2-digit"})}`,W-MR-2,28,{align:"right"});
+
+  let Y=54;
+  doc.setTextColor(...INK); doc.setFont("times","bolditalic"); doc.setFontSize(18);
+  doc.text(`${r.apellido}, ${r.nombre}`,ML,Y);
+  Y+=5; doc.setDrawColor(...GOLD); doc.setLineWidth(0.5); doc.line(ML,Y,ML+CW,Y);
+
+  Y+=8;
+  const tipoLabel={"juicio-falso":"JUICIO LABORAL FRAUDULENTO","testigo-falso":"TESTIGOS FALSOS","ambos":"JUICIO FRAUDULENTO + TESTIGOS FALSOS"}[r.tipo]||r.tipo.toUpperCase();
+  const bColor=r.tipo==="juicio-falso"?RED:r.tipo==="testigo-falso"?GOLD:MID;
+  const bW=doc.getStringUnitWidth(tipoLabel)*7*0.352+8;
+  doc.setFillColor(...bColor); doc.roundedRect(ML,Y-4,bW,6.5,1,1,"F");
+  doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(7);
+  doc.text(tipoLabel,ML+4,Y+0.8);
+
+  Y+=14;
+  const mitad=ML+CW/2+5;
+  function campo2(e1,v1,e2,v2,yy){
+    doc.setFont("helvetica","bold"); doc.setFontSize(6.5); doc.setTextColor(...MID); doc.text(e1,ML,yy);
+    doc.setFont("helvetica","normal"); doc.setFontSize(10); doc.setTextColor(...INK); doc.text(String(v1||"—"),ML,yy+5);
+    if(e2){ doc.setFont("helvetica","bold"); doc.setFontSize(6.5); doc.setTextColor(...MID); doc.text(e2,mitad,yy);
+      doc.setFont("helvetica","normal"); doc.setFontSize(10); doc.setTextColor(...INK); doc.text(String(v2||"—"),mitad,yy+5); }
+  }
+  campo2("CUIL",r.cuil,"EXPEDIENTE N°",r.nro,Y); Y+=16;
+  campo2("DNI",r.dni,"AÑO",String(r.anio),Y); Y+=16;
+  campo2("JURISDICCIÓN",r.jurisdiccion,"",null,Y); Y+=16;
+  doc.setFont("helvetica","bold"); doc.setFontSize(6.5); doc.setTextColor(...MID); doc.text("TRIBUNAL / JUZGADO",ML,Y);
+  doc.setFont("helvetica","normal"); doc.setFontSize(10); doc.setTextColor(...INK); doc.text(r.tribunal||"—",ML,Y+5); Y+=16;
+
+  doc.setDrawColor(...LIGHT); doc.setLineWidth(0.3); doc.line(ML,Y,ML+CW,Y); Y+=8;
+
+  doc.setFont("helvetica","bold"); doc.setFontSize(6.5); doc.setTextColor(...MID); doc.text("DESCRIPCIÓN DEL FRAUDE",ML,Y); Y+=5;
+  const lines=doc.splitTextToSize(r.descripcion||"",CW-8);
+  const dH=lines.length*5+8;
+  doc.setFillColor(240,238,234); doc.roundedRect(ML,Y-1,CW,dH,2,2,"F");
+  doc.setDrawColor(...LIGHT); doc.setLineWidth(0.2); doc.roundedRect(ML,Y-1,CW,dH,2,2,"S");
+  doc.setDrawColor(...GOLD); doc.setLineWidth(1.5); doc.line(ML+0.8,Y-1,ML+0.8,Y-1+dH);
+  doc.setFont("helvetica","normal"); doc.setFontSize(9.5); doc.setTextColor(50,45,40);
+  doc.text(lines,ML+5,Y+5); Y+=dH+10;
+
+  // Adjuntos en PDF
+  if (activeAdjuntos.length) {
+    doc.setDrawColor(...LIGHT); doc.setLineWidth(0.3); doc.line(ML,Y,ML+CW,Y); Y+=8;
+    doc.setFont("helvetica","bold"); doc.setFontSize(6.5); doc.setTextColor(...MID);
+    doc.text(`ARCHIVOS ADJUNTOS (${activeAdjuntos.length})`,ML,Y); Y+=6;
+    activeAdjuntos.forEach((a,i)=>{
+      const url=sb.storage.from(BUCKET).getPublicUrl(a.ruta).data.publicUrl;
+      doc.setFont("helvetica","normal"); doc.setFontSize(8.5); doc.setTextColor(...INK);
+      doc.text(`${i+1}. ${a.nombre}`,ML+3,Y);
+      doc.setTextColor(100,100,200); doc.setFontSize(7);
+      doc.textWithLink("Ver archivo",ML+3,Y+4,{url});
+      doc.setTextColor(...MID);
+      Y+=12;
+    });
+  }
+
+  const pieY=H-20;
+  doc.setDrawColor(...LIGHT); doc.setLineWidth(0.3); doc.line(ML,pieY,ML+CW,pieY);
+  doc.setFont("helvetica","normal"); doc.setFontSize(6.5); doc.setTextColor(...MID);
+  doc.text("Documento generado por el sistema Registro de Litigantes Maliciosos.",ML,pieY+5);
+  doc.text("La información proviene de expedientes judiciales de acceso público.",ML,pieY+9);
+  const ref=`REF-${Date.now().toString(36).toUpperCase()}`;
+  doc.setTextColor(...GOLD); doc.text(`Ref: ${ref}`,W-MR,pieY+5,{align:"right"});
+
+  doc.save(`expediente_${r.apellido.toLowerCase().replace(/\s+/g,"_")}_${r.anio}.pdf`);
+  btn.disabled=false; btn.textContent="Descargar PDF";
+}
+
+function watermark(doc,W,H){
+  doc.saveGraphicsState();
+  doc.setGState(new doc.GState({opacity:0.04}));
+  doc.setFont("helvetica","bold"); doc.setFontSize(38); doc.setTextColor(13,13,15);
+  for(let yy=40;yy<H-20;yy+=60) for(let xx=-10;xx<W+10;xx+=90) doc.text("RLM",xx,yy,{angle:35});
+  doc.restoreGraphicsState();
+}
+
+// ── TOAST ─────────────────────────────────────────────────────────
+function mostrarToast(msg, tipo="ok") {
+  const t=byId("toast");
+  t.textContent=msg;
+  t.className="toast show "+(tipo==="error"?"toast-error":"toast-ok");
+  setTimeout(()=>t.classList.remove("show"),3000);
+}
+
+// ── AUTH UI ───────────────────────────────────────────────────────
+function authErr(msg) { const e=byId("auth-error"); e.textContent=msg; e.style.display="block"; }
+function setBusy(on)  { byId("btn-login").disabled=on; byId("btn-register").disabled=on; byId("auth-error").style.display="none"; }
+function sbErr(msg) {
+  if(msg.includes("already registered")||msg.includes("already been registered")) return "Ese email ya está registrado.";
+  if(msg.includes("Invalid login")) return "Email o contraseña incorrectos.";
+  if(msg.includes("Email not confirmed")) return "Confirmá tu email antes de ingresar.";
+  return "Error inesperado. Intentá de nuevo.";
+}
+function showAuth(){ byId("screen-auth").style.display="flex"; byId("screen-app").style.display="none"; }
+function showApp(){
+  byId("screen-auth").style.display="none"; byId("screen-app").style.display="block";
+  const nom=currentProfile?`${currentProfile.nombre||""} ${currentProfile.apellido||""}`.trim()||currentUser.email:currentUser.email;
+  byId("u-name").textContent=nom; byId("u-emp").textContent=currentProfile?.empresa||"";
+  byId("nav-admin").style.display=isAdmin?"inline-block":"none";
+  showSection("archivo");
+  refrescarTabla();
+}
+function showAuthTab(tab){
+  byId("auth-error").style.display="none";
+  ["login","register"].forEach(t=>{ byId("form-"+t).style.display=t===tab?"flex":"none"; byId("authtab-"+t).classList.toggle("active",t===tab); });
+}
+function showSection(id){
+  document.querySelectorAll(".app-sec").forEach(s=>s.classList.remove("active"));
+  document.querySelectorAll(".nbtn").forEach(b=>b.classList.remove("active"));
+  byId("sec-"+id).classList.add("active"); byId("nav-"+id).classList.add("active");
+  if(id==="admin") loadUsuarios();
+}
+</script>
+
+<style>
+:root{
+  --bg:#0c0c0f;--bg2:#111116;--bg3:#17171e;--bg4:#1e1e27;
+  --b1:#252530;--b2:#323240;
+  --txt:#e4e2dc;--muted:#706e7c;
+  --gold:#c9a84c;--gold2:#9a7828;
+  --red:#c0392b;--red2:#922b21;--redfg:#e07868;
+  --green:#2a6e45;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--txt);min-height:100vh;font-size:15px;line-height:1.5;}
+
+/* AUTH */
+#screen-auth{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
+  background:radial-gradient(ellipse 55% 35% at 15% 15%,rgba(201,168,76,.07) 0%,transparent 60%),
+             radial-gradient(ellipse 45% 45% at 85% 85%,rgba(192,57,43,.05) 0%,transparent 60%),var(--bg);}
+.auth-wrap{width:100%;max-width:420px;}
+.auth-brand{text-align:center;margin-bottom:30px;}
+.seal{width:52px;height:52px;border:1.5px solid var(--gold2);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:22px;color:var(--gold);margin-bottom:12px;}
+.auth-brand h1{font-family:'Playfair Display',serif;font-size:1.45rem;font-weight:700;color:var(--txt);line-height:1.2;}
+.auth-brand p{font-family:'DM Mono',monospace;font-size:.7rem;color:var(--muted);letter-spacing:.12em;text-transform:uppercase;margin-top:5px;}
+.auth-card{background:var(--bg2);border:1px solid var(--b1);border-radius:8px;overflow:hidden;box-shadow:0 28px 64px rgba(0,0,0,.55);}
+.auth-tabs{display:flex;border-bottom:1px solid var(--b1);}
+.auth-tabs button{flex:1;background:none;border:none;padding:13px;font-family:'DM Mono',monospace;font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .2s;}
+.auth-tabs button.active{color:var(--gold);border-bottom-color:var(--gold);}
+.auth-form{padding:26px 28px;display:flex;flex-direction:column;gap:14px;}
+.r2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+.fg{display:flex;flex-direction:column;gap:5px;}
+.fg label{font-family:'DM Mono',monospace;font-size:.63rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);}
+.fg input,.fg select,.fg textarea{background:var(--bg3);border:1px solid var(--b1);border-radius:4px;padding:10px 12px;font-family:'DM Sans',sans-serif;font-size:.875rem;color:var(--txt);outline:none;transition:border-color .2s;}
+.fg input:focus,.fg select:focus,.fg textarea:focus{border-color:var(--gold2);background:var(--bg4);}
+.fg textarea{resize:vertical;min-height:90px;line-height:1.5;}
+.fg select option{background:var(--bg3);}
+#auth-error{display:none;background:rgba(192,57,43,.12);border:1px solid rgba(192,57,43,.3);border-radius:4px;padding:10px 14px;font-size:.82rem;color:var(--redfg);}
+.btn-main{background:var(--gold2);color:#0c0c0f;border:none;padding:12px;border-radius:4px;font-family:'DM Mono',monospace;font-size:.73rem;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;font-weight:500;transition:background .2s;margin-top:4px;}
+.btn-main:hover{background:var(--gold);}.btn-main:disabled{opacity:.4;cursor:not-allowed;}
+
+/* APP */
+#screen-app{display:none;}
+header{background:var(--bg2);border-bottom:1px solid var(--b1);position:sticky;top:0;z-index:50;}
+.hinner{max-width:1240px;margin:0 auto;padding:0 32px;display:flex;align-items:center;gap:16px;height:58px;}
+.brand{display:flex;align-items:center;gap:10px;flex-shrink:0;}
+.brand .seal{width:30px;height:30px;font-size:13px;margin:0;}
+.brand-name{font-family:'Playfair Display',serif;font-size:.95rem;font-weight:700;color:var(--txt);white-space:nowrap;}
+nav{display:flex;gap:2px;margin-left:20px;}
+.nbtn{background:none;border:none;color:var(--muted);font-family:'DM Mono',monospace;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;padding:7px 13px;cursor:pointer;border-radius:4px;transition:all .2s;}
+.nbtn:hover{color:var(--txt);background:var(--bg3);}.nbtn.active{color:var(--gold);background:rgba(201,168,76,.09);}
+.uinfo{margin-left:auto;display:flex;align-items:center;gap:12px;}
+.upill{text-align:right;}
+.upill .u-n{font-size:.82rem;font-weight:500;color:var(--txt);line-height:1.2;}
+.upill .u-e{font-family:'DM Mono',monospace;font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;}
+.btn-out{background:none;border:1px solid var(--b1);color:var(--muted);padding:6px 11px;border-radius:4px;font-family:'DM Mono',monospace;font-size:.63rem;letter-spacing:.09em;text-transform:uppercase;cursor:pointer;transition:all .2s;}
+.btn-out:hover{border-color:var(--red2);color:var(--redfg);}
+
+/* MAIN */
+.amain{max-width:1240px;margin:0 auto;padding:40px 32px;}
+.app-sec{display:none;}.app-sec.active{display:block;}
+.sh{margin-bottom:26px;padding-bottom:16px;border-bottom:1px solid var(--b1);display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;}
+.sh-text h2{font-family:'Playfair Display',serif;font-size:1.75rem;font-weight:900;color:var(--txt);}
+.sh-text p{color:var(--muted);font-size:.83rem;margin-top:4px;}
+.btn-nuevo{background:var(--gold2);color:#0c0c0f;border:none;padding:9px 18px;border-radius:4px;font-family:'DM Mono',monospace;font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;font-weight:500;transition:background .2s;white-space:nowrap;align-self:flex-end;}
+.btn-nuevo:hover{background:var(--gold);}
+
+/* SEARCH */
+.sblock{background:var(--bg2);border:1px solid var(--b1);border-radius:6px;padding:18px 22px;margin-bottom:20px;display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;}
+.sf{display:flex;flex-direction:column;gap:5px;flex:1;min-width:130px;}
+.sf label{font-family:'DM Mono',monospace;font-size:.62rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);}
+.sf input{background:var(--bg3);border:1px solid var(--b1);border-radius:4px;padding:9px 11px;font-family:'DM Sans',sans-serif;font-size:.875rem;color:var(--txt);outline:none;transition:border-color .2s;}
+.sf input:focus{border-color:var(--gold2);}
+.btn-sm{background:var(--bg3);border:1px solid var(--b1);color:var(--muted);padding:9px 15px;border-radius:4px;font-family:'DM Mono',monospace;font-size:.67rem;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;transition:all .2s;align-self:flex-end;}
+.btn-sm:hover{border-color:var(--b2);color:var(--txt);}
+.rbar{margin-bottom:10px;}
+.rbar span{font-family:'DM Mono',monospace;font-size:.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;}
+.rbar em{color:var(--gold);font-style:normal;}
+
+/* TABLE */
+.twrap{border:1px solid var(--b1);border-radius:6px;overflow:hidden;}
+table{width:100%;border-collapse:collapse;}
+thead tr{background:var(--bg3);}
+thead th{font-family:'DM Mono',monospace;font-size:.6rem;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);padding:11px 15px;text-align:left;font-weight:500;white-space:nowrap;border-bottom:1px solid var(--b1);}
+tbody tr{border-bottom:1px solid var(--b1);transition:background .14s;cursor:pointer;}
+tbody tr:last-child{border-bottom:none;}
+tbody tr:hover{background:var(--bg3);}
+tbody td{padding:13px 15px;font-size:.84rem;vertical-align:middle;}
+.td-n{font-weight:600;color:var(--txt);}
+.td-actions{display:flex;gap:6px;align-items:center;}
+.mono{font-family:'DM Mono',monospace;font-size:.77rem;color:var(--muted);}
+.badge{display:inline-block;font-family:'DM Mono',monospace;font-size:.6rem;text-transform:uppercase;letter-spacing:.06em;padding:3px 8px;border-radius:3px;white-space:nowrap;}
+.badge-red{background:rgba(192,57,43,.15);color:var(--redfg);border:1px solid rgba(192,57,43,.3);}
+.badge-gold{background:rgba(201,168,76,.12);color:var(--gold);border:1px solid rgba(201,168,76,.25);}
+.badge-dim{background:rgba(255,255,255,.04);color:var(--muted);border:1px solid var(--b2);}
+.empty-state{text-align:center;padding:52px;color:var(--muted);display:none;}
+.empty-state p{font-size:.84rem;margin-top:8px;}
+
+/* MODAL DETALLE */
+#modal{display:none;position:fixed;inset:0;z-index:200;align-items:center;justify-content:center;padding:20px;}
+#modal.open{display:flex;}
+#modal-overlay{position:absolute;inset:0;background:rgba(0,0,0,.78);cursor:pointer;}
+.mbox{position:relative;background:var(--bg2);border:1px solid var(--b2);border-radius:8px;max-width:660px;width:100%;max-height:88vh;overflow-y:auto;box-shadow:0 36px 80px rgba(0,0,0,.65);animation:mIn .18s ease;}
+@keyframes mIn{from{opacity:0;transform:translateY(10px) scale(.98);}to{opacity:1;transform:translateY(0) scale(1);}}
+.mhead{background:var(--bg3);border-bottom:1px solid var(--b1);padding:20px 24px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px;}
+.mhead h3{font-family:'Playfair Display',serif;font-size:1.22rem;font-weight:700;color:var(--txt);line-height:1.2;}
+.mhead .mch{font-family:'DM Mono',monospace;font-size:.68rem;color:var(--muted);margin-top:3px;letter-spacing:.06em;}
+#btn-modal-close{background:none;border:1px solid var(--b1);color:var(--muted);width:28px;height:28px;cursor:pointer;font-size:13px;border-radius:4px;flex-shrink:0;transition:all .15s;display:flex;align-items:center;justify-content:center;}
+#btn-modal-close:hover{border-color:var(--red2);color:var(--redfg);}
+.mbody{padding:24px;}
+.mgrid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:18px;}
+.mf label{display:block;font-family:'DM Mono',monospace;font-size:.6rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:3px;}
+.mf p{font-size:.875rem;color:var(--txt);font-weight:500;}
+.mf.full{grid-column:1/-1;}
+.mdiv{border:none;border-top:1px solid var(--b1);margin:16px 0;}
+.audit-chip{background:rgba(201,168,76,.06);border:1px solid rgba(201,168,76,.15);border-radius:4px;padding:7px 12px;margin-bottom:18px;text-align:center;font-family:'DM Mono',monospace;font-size:.62rem;color:var(--gold2);text-transform:uppercase;letter-spacing:.08em;}
+
+/* ADJUNTOS EN MODAL */
+.adj-section-title{font-family:'DM Mono',monospace;font-size:.62rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:10px;}
+#m-adjuntos-lista{display:flex;flex-wrap:wrap;gap:8px;margin-top:2px;}
+.adj-chip{display:inline-flex;align-items:center;gap:5px;background:var(--bg3);border:1px solid var(--b1);border-radius:4px;padding:6px 10px;font-size:.8rem;color:var(--txt);text-decoration:none;transition:all .15s;}
+.adj-chip:hover{border-color:var(--gold2);color:var(--gold);}
+.adj-loading,.adj-empty{font-size:.8rem;color:var(--muted);font-family:'DM Mono',monospace;}
+
+/* BOTTOM BAR MODAL */
+.modal-bottom-bar{margin-top:20px;padding-top:16px;border-top:1px solid var(--b1);display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;}
+.modal-bottom-bar span{font-family:'DM Mono',monospace;font-size:.65rem;color:var(--muted);}
+.modal-admin-btns{display:flex;gap:8px;}
+#btn-pdf{background:var(--red2);color:#fff;border:none;padding:10px 20px;border-radius:4px;font-family:'DM Mono',monospace;font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:background .2s;display:flex;align-items:center;gap:6px;}
+#btn-pdf::before{content:"⬇";font-size:.8rem;}
+#btn-pdf:hover{background:var(--red);}.btn-pdf:disabled{opacity:.5;cursor:not-allowed;}
+.btn-edit-modal{background:none;border:1px solid var(--gold2);color:var(--gold);padding:9px 16px;border-radius:4px;font-family:'DM Mono',monospace;font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:all .2s;}
+.btn-edit-modal:hover{background:rgba(201,168,76,.1);}
+
+/* MODAL FORMULARIO EXPEDIENTE */
+#modal-form-exp{display:none;position:fixed;inset:0;z-index:210;align-items:center;justify-content:center;padding:20px;}
+#modal-form-exp.open{display:flex;}
+#modal-form-overlay{position:absolute;inset:0;background:rgba(0,0,0,.82);}
+.mform-box{position:relative;background:var(--bg2);border:1px solid var(--b2);border-radius:8px;max-width:680px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:0 36px 80px rgba(0,0,0,.7);animation:mIn .18s ease;}
+.mform-head{background:var(--bg3);border-bottom:1px solid var(--b1);padding:18px 24px;display:flex;justify-content:space-between;align-items:center;}
+.mform-head h3{font-family:'Playfair Display',serif;font-size:1.1rem;font-weight:700;color:var(--txt);}
+.mform-close{background:none;border:1px solid var(--b1);color:var(--muted);width:28px;height:28px;cursor:pointer;font-size:13px;border-radius:4px;display:flex;align-items:center;justify-content:center;transition:all .15s;}
+.mform-close:hover{border-color:var(--red2);color:var(--redfg);}
+.mform-body{padding:24px;display:flex;flex-direction:column;gap:16px;}
+.form-section-lbl{font-family:'DM Mono',monospace;font-size:.63rem;text-transform:uppercase;letter-spacing:.12em;color:var(--gold2);padding-bottom:8px;border-bottom:1px solid var(--b1);}
+.form-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+.form-grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;}
+.fg-full{grid-column:1/-1;}
+
+/* Adjuntos en form */
+.adj-label{font-family:'DM Mono',monospace;font-size:.63rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:6px;}
+#adj-existentes{display:flex;flex-direction:column;gap:6px;margin-bottom:10px;}
+.adj-item{display:flex;align-items:center;justify-content:space-between;background:var(--bg3);border:1px solid var(--b1);border-radius:4px;padding:7px 10px;}
+.adj-link{font-size:.82rem;color:var(--gold);text-decoration:none;}
+.adj-link:hover{text-decoration:underline;}
+.adj-del{background:none;border:none;color:var(--muted);cursor:pointer;font-size:12px;transition:color .15s;padding:0 4px;}
+.adj-del:hover{color:var(--redfg);}
+.file-input-wrap{background:var(--bg3);border:1px dashed var(--b2);border-radius:4px;padding:12px;cursor:pointer;transition:border-color .2s;}
+.file-input-wrap:hover{border-color:var(--gold2);}
+.file-input-wrap input[type="file"]{width:100%;font-size:.82rem;color:var(--muted);cursor:pointer;background:none;border:none;outline:none;}
+
+.mform-footer{padding:16px 24px;border-top:1px solid var(--b1);display:flex;gap:10px;justify-content:flex-end;}
+#btn-guardar-exp{background:var(--gold2);color:#0c0c0f;border:none;padding:10px 24px;border-radius:4px;font-family:'DM Mono',monospace;font-size:.73rem;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;font-weight:500;transition:background .2s;}
+#btn-guardar-exp:hover{background:var(--gold);}
+#btn-guardar-exp:disabled{opacity:.4;cursor:not-allowed;}
+.btn-cancelar{background:none;border:1px solid var(--b1);color:var(--muted);padding:10px 18px;border-radius:4px;font-family:'DM Mono',monospace;font-size:.7rem;letter-spacing:.09em;text-transform:uppercase;cursor:pointer;transition:all .2s;}
+.btn-cancelar:hover{border-color:var(--b2);color:var(--txt);}
+
+/* ADMIN */
+.atabs{display:flex;gap:2px;margin-bottom:22px;border-bottom:1px solid var(--b1);}
+.atab{background:none;border:none;color:var(--muted);font-family:'DM Mono',monospace;font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;padding:9px 17px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .2s;}
+.atab:hover{color:var(--txt);}.atab.active{color:var(--gold);border-bottom-color:var(--gold);}
+.panel-title{font-family:'DM Mono',monospace;font-size:.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px;}
+.cell-info{text-align:center;padding:30px;font-size:.82rem;color:var(--muted);font-family:'DM Mono',monospace;}
+.btn-mini{background:none;border:1px solid var(--b1);color:var(--gold2);padding:4px 10px;border-radius:3px;font-family:'DM Mono',monospace;font-size:.62rem;text-transform:uppercase;letter-spacing:.06em;cursor:pointer;transition:all .15s;}
+.btn-mini:hover{border-color:var(--gold2);color:var(--gold);}
+.btn-mini-red{color:var(--redfg);border-color:rgba(192,57,43,.3);}
+.btn-mini-red:hover{border-color:var(--red2);color:var(--red);}
+
+/* TOAST */
+.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(20px);padding:11px 22px;border-radius:6px;font-family:'DM Mono',monospace;font-size:.75rem;letter-spacing:.08em;opacity:0;transition:all .3s;z-index:500;pointer-events:none;}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+.toast-ok{background:#1a3d2a;border:1px solid #2a6e45;color:#6dd89a;}
+.toast-error{background:#3d1a1a;border:1px solid var(--red2);color:var(--redfg);}
+
+@media(max-width:640px){
+  .hinner{padding:0 16px;}.amain{padding:24px 16px;}
+  .sblock{flex-direction:column;}.mgrid{grid-template-columns:1fr;}
+  .r2,.form-grid-2,.form-grid-3{grid-template-columns:1fr;}
+  .brand-name,.upill .u-e{display:none;}
+  table{font-size:.8rem;}thead th,tbody td{padding:10px 12px;}
+}
+</style>
+</head>
+<body>
+
+<!-- AUTH -->
+<div id="screen-auth">
+  <div class="auth-wrap">
+    <div class="auth-brand">
+      <div class="seal">⚖</div>
+      <h1>Registro de Litigantes Maliciosos</h1>
+      <p>Acceso restringido — usuarios registrados</p>
+    </div>
+    <div class="auth-card">
+      <div class="auth-tabs">
+        <button class="active" id="authtab-login"    onclick="showAuthTab('login')">Ingresar</button>
+        <button               id="authtab-register" onclick="showAuthTab('register')">Registrarse</button>
+      </div>
+      <form id="form-login" class="auth-form" onsubmit="event.preventDefault();handleLogin()">
+        <div id="auth-error"></div>
+        <div class="fg"><label>Email</label><input type="email" id="l-email" placeholder="usuario@empresa.com" autocomplete="email"></div>
+        <div class="fg"><label>Contraseña</label><input type="password" id="l-password" placeholder="••••••••" autocomplete="current-password"></div>
+        <button type="submit" class="btn-main" id="btn-login">Ingresar al sistema</button>
+      </form>
+      <form id="form-register" class="auth-form" style="display:none" onsubmit="event.preventDefault();handleRegister()">
+        <div id="auth-error"></div>
+        <div class="r2">
+          <div class="fg"><label>Nombre *</label><input type="text" id="r-nombre" placeholder="Nombre/s"></div>
+          <div class="fg"><label>Apellido *</label><input type="text" id="r-apellido" placeholder="Apellido/s"></div>
+        </div>
+        <div class="fg"><label>Email *</label><input type="email" id="r-email" placeholder="usuario@empresa.com" autocomplete="email"></div>
+        <div class="r2">
+          <div class="fg"><label>Empresa *</label><input type="text" id="r-empresa" placeholder="Empresa empleadora"></div>
+          <div class="fg"><label>Cargo *</label><input type="text" id="r-cargo" placeholder="Ej: RRHH, Legal"></div>
+        </div>
+        <div class="fg"><label>Contraseña *</label><input type="password" id="r-password" placeholder="Mínimo 6 caracteres" autocomplete="new-password"></div>
+        <button type="submit" class="btn-main" id="btn-register">Crear cuenta</button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="screen-app">
+  <header>
+    <div class="hinner">
+      <div class="brand">
+        <div class="seal" style="width:30px;height:30px;font-size:13px;margin:0">⚖</div>
+        <span class="brand-name">Reg. Litigantes Maliciosos</span>
+      </div>
+      <nav>
+        <button class="nbtn active" id="nav-archivo" onclick="showSection('archivo')">Archivo</button>
+        <button class="nbtn"        id="nav-admin"   onclick="showSection('admin')" style="display:none">Admin</button>
+      </nav>
+      <div class="uinfo">
+        <div class="upill"><div class="u-n" id="u-name"></div><div class="u-e" id="u-emp"></div></div>
+        <button class="btn-out" onclick="handleLogout()">Salir</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="amain">
+
+    <!-- ARCHIVO -->
+    <section class="app-sec" id="sec-archivo">
+      <div class="sh">
+        <div class="sh-text">
+          <h2>Archivo de expedientes</h2>
+          <p>Hacé clic en un registro para ver el detalle, adjuntos y descargar el reporte PDF.</p>
+        </div>
+        <button class="btn-nuevo" id="btn-nuevo-exp" onclick="abrirFormExpediente()" style="display:none">+ Nuevo expediente</button>
+      </div>
+      <div class="sblock">
+        <div class="sf"><label>Nombre</label><input type="text" id="s-nombre" placeholder="Ej: Juan" oninput="filtrar()"></div>
+        <div class="sf"><label>Apellido</label><input type="text" id="s-apellido" placeholder="Ej: García" oninput="filtrar()"></div>
+        <div class="sf"><label>CUIL</label><input type="text" id="s-cuil" placeholder="XX-XXXXXXXX-X" oninput="filtrar()"></div>
+        <button class="btn-sm" onclick="limpiar()">Limpiar</button>
+      </div>
+      <div class="rbar"><span><em id="count-num">0</em> registros encontrados</span></div>
+      <div class="twrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Apellido y Nombre</th><th>CUIL</th><th>Tipo de fraude</th>
+              <th>Año</th><th>Jurisdicción</th><th>N° Expediente</th>
+              <th id="th-acciones" style="display:none"></th>
+            </tr>
+          </thead>
+          <tbody id="tabla-body"></tbody>
+        </table>
+        <div class="empty-state" id="empty-state">
+          <div style="font-size:2rem;opacity:.25">🔍</div>
+          <p>No hay expedientes cargados aún.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ADMIN -->
+    <section class="app-sec" id="sec-admin">
+      <div class="sh"><div class="sh-text"><h2>Panel de administración</h2><p>Usuarios registrados y log de accesos al archivo.</p></div></div>
+      <div class="atabs">
+        <button class="atab active" id="atab-usuarios"  onclick="loadUsuarios()">Usuarios</button>
+        <button class="atab"        id="atab-auditoria" onclick="loadAuditoria()">Log de accesos</button>
+      </div>
+      <div id="panel-usuarios">
+        <div class="twrap"><table>
+          <thead><tr><th>Apellido y Nombre</th><th>Email</th><th>Empresa</th><th>Cargo</th><th>Registro</th><th></th></tr></thead>
+          <tbody id="t-usuarios"><tr><td colspan="6" class="cell-info">Cargando...</td></tr></tbody>
+        </table></div>
+      </div>
+      <div id="panel-auditoria" style="display:none">
+        <div class="panel-title" id="audit-titulo">Todos los accesos</div>
+        <div class="twrap"><table>
+          <thead><tr><th>Usuario</th><th>Email</th><th>Empresa</th><th>Expediente consultado</th><th>CUIL</th><th>Fecha y hora</th></tr></thead>
+          <tbody id="t-auditoria"><tr><td colspan="6" class="cell-info">Cargando...</td></tr></tbody>
+        </table></div>
+      </div>
+    </section>
+
+  </div>
+</div>
+
+<!-- MODAL DETALLE -->
+<div id="modal">
+  <div id="modal-overlay" onclick="cerrarModal(event)"></div>
+  <div class="mbox">
+    <div class="mhead">
+      <div><h3 id="m-nombre"></h3><div class="mch" id="m-cuil-h"></div></div>
+      <button id="btn-modal-close" onclick="cerrarModal(event)">✕</button>
+    </div>
+    <div class="mbody">
+      <div class="audit-chip">⚑ Esta consulta queda registrada en el log de auditoría</div>
+      <div class="mgrid">
+        <div class="mf"><label>CUIL</label><p class="mono" id="m-cuil"></p></div>
+        <div class="mf"><label>DNI</label><p class="mono" id="m-dni"></p></div>
+        <div class="mf"><label>Tipo de fraude</label><p id="m-tipo"></p></div>
+        <div class="mf"><label>Año del expediente</label><p id="m-anio"></p></div>
+        <div class="mf"><label>N° Expediente</label><p class="mono" id="m-nro"></p></div>
+        <div class="mf"><label>Jurisdicción</label><p id="m-jur"></p></div>
+        <div class="mf full"><label>Tribunal / Juzgado</label><p id="m-trib"></p></div>
+      </div>
+      <hr class="mdiv">
+      <div class="mf">
+        <label>Descripción del fraude</label>
+        <p id="m-desc" style="margin-top:6px;line-height:1.65;font-size:.875rem;color:#bab8b0;font-weight:400;"></p>
+      </div>
+      <hr class="mdiv">
+      <div>
+        <div class="adj-section-title">Archivos adjuntos / Pruebas</div>
+        <div id="m-adjuntos-lista"></div>
+      </div>
+      <div class="modal-bottom-bar">
+        <div id="modal-admin-btns" class="modal-admin-btns" style="display:none">
+          <button class="btn-edit-modal" onclick="editarDesdeModal()">✎ Editar</button>
+        </div>
+        <span>El PDF incluye todos los datos y lista de adjuntos.</span>
+        <button id="btn-pdf" onclick="generarPDF()">Descargar PDF</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL FORMULARIO EXPEDIENTE -->
+<div id="modal-form-exp">
+  <div id="modal-form-overlay" onclick="cerrarFormExpediente()"></div>
+  <div class="mform-box">
+    <div class="mform-head">
+      <h3 id="form-exp-titulo">Nuevo expediente</h3>
+      <button class="mform-close" onclick="cerrarFormExpediente()">✕</button>
+    </div>
+    <div class="mform-body">
+
+      <div class="form-section-lbl">Datos del empleado</div>
+      <div class="form-grid-2">
+        <div class="fg"><label>Apellido *</label><input type="text" id="e-apellido" placeholder="Apellido/s"></div>
+        <div class="fg"><label>Nombre *</label><input type="text" id="e-nombre" placeholder="Nombre/s"></div>
+        <div class="fg"><label>CUIL *</label><input type="text" id="e-cuil" placeholder="XX-XXXXXXXX-X"></div>
+        <div class="fg"><label>DNI</label><input type="text" id="e-dni" placeholder="Número de DNI"></div>
+      </div>
+
+      <div class="form-section-lbl">Datos del expediente</div>
+      <div class="form-grid-3">
+        <div class="fg"><label>Tipo de fraude *</label>
+          <select id="e-tipo">
+            <option value="">Seleccionar...</option>
+            <option value="juicio-falso">Juicio laboral fraudulento</option>
+            <option value="testigo-falso">Testigos falsos</option>
+            <option value="ambos">Ambos</option>
+          </select>
+        </div>
+        <div class="fg"><label>Año *</label><input type="number" id="e-anio" placeholder="Ej: 2023" min="1990" max="2099"></div>
+        <div class="fg"><label>N° Expediente</label><input type="text" id="e-nro" placeholder="Ej: 12345/2023"></div>
+        <div class="fg"><label>Jurisdicción</label>
+          <select id="e-jurisdiccion">
+            <option value="">Seleccionar...</option>
+            <option>CABA</option><option>Buenos Aires</option><option>Córdoba</option>
+            <option>Santa Fe</option><option>Mendoza</option><option>Tucumán</option>
+            <option>Entre Ríos</option><option>Salta</option><option>Misiones</option>
+            <option>Chaco</option><option>Corrientes</option><option>Santiago del Estero</option>
+            <option>San Juan</option><option>Jujuy</option><option>Río Negro</option>
+            <option>Neuquén</option><option>Formosa</option><option>Chubut</option>
+            <option>San Luis</option><option>Catamarca</option><option>La Rioja</option>
+            <option>La Pampa</option><option>Santa Cruz</option><option>Tierra del Fuego</option>
+          </select>
+        </div>
+        <div class="fg fg-full"><label>Tribunal / Juzgado</label><input type="text" id="e-tribunal" placeholder="Ej: Juzgado Nacional del Trabajo N° 8"></div>
+      </div>
+      <div class="fg"><label>Descripción del fraude</label>
+        <textarea id="e-descripcion" placeholder="Describí los hechos y la naturaleza del fraude..."></textarea>
+      </div>
+
+      <div class="form-section-lbl">Archivos adjuntos / Pruebas</div>
+      <div id="adj-existentes"></div>
+      <div class="file-input-wrap">
+        <input type="file" id="e-adjuntos" multiple accept="image/*,.pdf" >
+      </div>
+      <div style="font-size:.75rem;color:var(--muted);margin-top:-6px;">Podés seleccionar múltiples archivos. Formatos: imágenes y PDF.</div>
+
+    </div>
+    <div class="mform-footer">
+      <button class="btn-cancelar" onclick="cerrarFormExpediente()">Cancelar</button>
+      <button id="btn-guardar-exp" onclick="guardarExpediente()">Guardar expediente</button>
+    </div>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<script>
+// Mostrar botón nuevo y columna acciones solo para admin
+sb.auth.onAuthStateChange((_e, session) => {
+  if (session?.user) {
+    const admin = session.user.email === ADMIN_EMAIL;
+    const btnNuevo = document.getElementById("btn-nuevo-exp");
+    const thAcc    = document.getElementById("th-acciones");
+    if (btnNuevo) btnNuevo.style.display = admin ? "block" : "none";
+    if (thAcc)    thAcc.style.display    = admin ? "" : "none";
+  }
+});
+
+function editarDesdeModal() {
+  const reg = activeRecord;
+  cerrarModal();
+  if (reg) abrirFormExpediente(reg);
+}
+</script>
+
+</body>
+</html>
