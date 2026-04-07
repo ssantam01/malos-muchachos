@@ -77,21 +77,26 @@ function setTiposCheckboxes(tipoStr) {
 }
 
 // ── AUTH STATE ────────────────────────────────────────────────────
+
 sb.auth.onAuthStateChange(async (_event, session) => {
   console.log("onAuthStateChange fired:", _event, session?.user?.email);
-  if (session?.user) {
-    currentUser = session.user;
-    isAdmin     = currentUser.email === ADMIN_EMAIL;
-    try {
-      const { data } = await sb.from("perfiles").select("*").eq("id", currentUser.id).single();
-      currentProfile = data || {};
-    } catch(_) { currentProfile = {}; }
-    console.log("calling showApp, isAdmin:", isAdmin);
-    showApp();
-  } else {
+  if (_event === "SIGNED_OUT") {
     currentUser = null; currentProfile = null; isAdmin = false;
-    console.log("calling showAuth");
     showAuth();
+    return;
+  }
+  if (_event === "SIGNED_IN" || _event === "INITIAL_SESSION") {
+    if (session?.user) {
+      currentUser = session.user;
+      isAdmin     = currentUser.email === ADMIN_EMAIL;
+      try {
+        const { data } = await sb.from("perfiles").select("*").eq("id", currentUser.id).single();
+        currentProfile = data || {};
+      } catch(_) { currentProfile = {}; }
+      showApp();
+    } else {
+      showAuth();
+    }
   }
 });
 
@@ -117,20 +122,9 @@ async function handleLogin() {
   const email=g("l-email"), password=g("l-password");
   if (!email||!password) return authErr("Complete email y contraseña.");
   setBusy(true);
-  console.log("attempting login for:", email);
-  const { data, error } = await sb.auth.signInWithPassword({ email, password });
-  console.log("login result - error:", error, "user:", data?.user?.email);
-  if (error) { setBusy(false); authErr(sbErr(error.message)); return; }
-  if (data?.user) {
-    currentUser = data.user;
-    isAdmin     = currentUser.email === ADMIN_EMAIL;
-    try {
-      const { data: perfil } = await sb.from("perfiles").select("*").eq("id", currentUser.id).single();
-      currentProfile = perfil || {};
-    } catch(_) { currentProfile = {}; }
-    console.log("manually calling showApp");
-    showApp();
-  }
+  const { error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) { setBusy(false); authErr(sbErr(error.message)); }
+  // onAuthStateChange se encarga del resto
 }
 
 async function handleLogout() { await sb.auth.signOut(); }
