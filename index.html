@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Registro de Litigantes Maliciosos</title>
+<title>MM - Registro de Litigantes Maliciosos</title>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -32,9 +32,49 @@ const x    = s  => String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").repl
 const loadingRow = c => `<tr><td colspan="${c}" class="cell-info">Cargando...</td></tr>`;
 const emptyRow   = (c,m) => `<tr><td colspan="${c}" class="cell-info">${m}</td></tr>`;
 
-const TIPO_LBL = {"juicio-falso":"Juicio laboral fraudulento","testigo-falso":"Presentación de testigos falsos","ambos":"Juicio fraudulento + testigos falsos"};
-const TIPO_SHORT = {"juicio-falso":"Juicio fraudulento","testigo-falso":"Testigos falsos","ambos":"Ambos"};
-const TIPO_CLS  = {"juicio-falso":"badge-red","testigo-falso":"badge-gold","ambos":"badge-dim"};
+const TIPO_LBL = {
+  "juicio-falso":    "Juicio laboral fraudulento",
+  "testigo-falso":   "Presentación de testigos falsos",
+  "cert-medico":     "Certificados médicos falsos",
+  "robo-laboral":    "Robo en ámbito laboral",
+};
+const TIPO_SHORT = {
+  "juicio-falso":    "Juicio fraudulento",
+  "testigo-falso":   "Testigos falsos",
+  "cert-medico":     "Cert. médicos falsos",
+  "robo-laboral":    "Robo laboral",
+};
+const TIPO_CLS = {
+  "juicio-falso":    "badge-red",
+  "testigo-falso":   "badge-gold",
+  "cert-medico":     "badge-blue",
+  "robo-laboral":    "badge-dim",
+};
+
+// Convierte string "a,b,c" a array de tipos
+function parseTipos(tipoStr) {
+  if (!tipoStr) return [];
+  return tipoStr.split(",").map(t=>t.trim()).filter(Boolean);
+}
+
+// Renderiza badges múltiples
+function renderBadges(tipoStr) {
+  return parseTipos(tipoStr).map(t =>
+    `<span class="badge ${TIPO_CLS[t]||'badge-dim'}">${TIPO_SHORT[t]||t}</span>`
+  ).join(" ");
+}
+
+// Lee los checkboxes del formulario
+function getTiposSeleccionados() {
+  return Array.from(document.querySelectorAll(".tipo-check:checked")).map(cb=>cb.value).join(",");
+}
+
+// Setea los checkboxes al editar
+function setTiposCheckboxes(tipoStr) {
+  document.querySelectorAll(".tipo-check").forEach(cb => {
+    cb.checked = parseTipos(tipoStr).includes(cb.value);
+  });
+}
 
 // ── AUTH STATE ────────────────────────────────────────────────────
 sb.auth.onAuthStateChange(async (_event, session) => {
@@ -105,14 +145,14 @@ async function guardarExpediente() {
   const nombre      = g("e-nombre");
   const cuil        = g("e-cuil");
   const dni         = g("e-dni");
-  const tipo        = g("e-tipo");
+  const tipo        = getTiposSeleccionados();
   const anio        = parseInt(g("e-anio"));
   const nro         = g("e-nro");
   const jurisdiccion= g("e-jurisdiccion");
   const tribunal    = g("e-tribunal");
   const descripcion = g("e-descripcion");
 
-  if (!apellido||!nombre||!cuil||!tipo||!anio) {
+  if (!apellido||!nombre||!cuil||!tipo||!anio||tipo==="") {
     mostrarToast("Completá los campos obligatorios (*).", "error"); return;
   }
 
@@ -177,7 +217,8 @@ async function abrirFormExpediente(reg = null) {
   ["e-apellido","e-nombre","e-cuil","e-dni","e-anio","e-nro","e-tribunal","e-descripcion"].forEach(id=>{
     const el=byId(id); if(el) el.value="";
   });
-  byId("e-tipo").value="";
+  // Limpiar checkboxes
+  document.querySelectorAll(".tipo-check").forEach(cb => cb.checked = false);
   byId("e-jurisdiccion").value="";
   byId("e-adjuntos").value="";
   byId("adj-existentes").innerHTML="";
@@ -187,7 +228,7 @@ async function abrirFormExpediente(reg = null) {
     byId("e-nombre").value      = reg.nombre||"";
     byId("e-cuil").value        = reg.cuil||"";
     byId("e-dni").value         = reg.dni||"";
-    byId("e-tipo").value        = reg.tipo||"";
+    setTiposCheckboxes(reg ? reg.tipo : "");
     byId("e-anio").value        = reg.anio||"";
     byId("e-nro").value         = reg.nro||"";
     byId("e-jurisdiccion").value= reg.jurisdiccion||"";
@@ -236,7 +277,9 @@ async function abrirModal(r) {
   s("m-nombre",  `${r.apellido}, ${r.nombre}`);
   s("m-cuil-h",  `CUIL ${r.cuil}`);
   s("m-cuil",    r.cuil);   s("m-dni",  r.dni);
-  s("m-tipo",    TIPO_LBL[r.tipo]); s("m-anio", r.anio);
+  // Renderizar tipos como badges múltiples
+  const mTipo = byId("m-tipo");
+  if (mTipo) mTipo.innerHTML = renderBadges(r.tipo) || "—";
   s("m-nro",     r.nro);    s("m-jur",  r.jurisdiccion);
   s("m-trib",    r.tribunal); s("m-desc", r.descripcion);
 
@@ -303,7 +346,7 @@ function renderTabla(data) {
     tr.innerHTML=`
       <td class="td-n">${x(r.apellido)}, ${x(r.nombre)}</td>
       <td class="mono">${x(r.cuil)}</td>
-      <td><span class="badge ${TIPO_CLS[r.tipo]}">${TIPO_SHORT[r.tipo]||r.tipo}</span></td>
+      <td>${renderBadges(r.tipo)}</td>
       <td>${r.anio}</td>
       <td>${x(r.jurisdiccion||"")}</td>
       <td class="mono">${x(r.nro||"")}` +
@@ -406,8 +449,8 @@ async function generarPDF() {
   Y+=5; doc.setDrawColor(...GOLD); doc.setLineWidth(0.5); doc.line(ML,Y,ML+CW,Y);
 
   Y+=8;
-  const tipoLabel={"juicio-falso":"JUICIO LABORAL FRAUDULENTO","testigo-falso":"TESTIGOS FALSOS","ambos":"JUICIO FRAUDULENTO + TESTIGOS FALSOS"}[r.tipo]||r.tipo.toUpperCase();
-  const bColor=r.tipo==="juicio-falso"?RED:r.tipo==="testigo-falso"?GOLD:MID;
+  const tipoLabel = parseTipos(r.tipo).map(t=>TIPO_SHORT[t]||t).join(" · ").toUpperCase() || (r.tipo||"").toUpperCase();
+  const bColor = parseTipos(r.tipo).includes("juicio-falso") ? RED : parseTipos(r.tipo).includes("testigo-falso") ? GOLD : MID;
   const bW=doc.getStringUnitWidth(tipoLabel)*7*0.352+8;
   doc.setFillColor(...bColor); doc.roundedRect(ML,Y-4,bW,6.5,1,1,"F");
   doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(7);
@@ -602,7 +645,14 @@ tbody td{padding:13px 15px;font-size:.84rem;vertical-align:middle;}
 .badge{display:inline-block;font-family:'DM Mono',monospace;font-size:.6rem;text-transform:uppercase;letter-spacing:.06em;padding:3px 8px;border-radius:3px;white-space:nowrap;}
 .badge-red{background:rgba(192,57,43,.15);color:var(--redfg);border:1px solid rgba(192,57,43,.3);}
 .badge-gold{background:rgba(201,168,76,.12);color:var(--gold);border:1px solid rgba(201,168,76,.25);}
+.badge-blue{background:rgba(60,100,200,.15);color:#7aadff;border:1px solid rgba(60,100,200,.3);}
 .badge-dim{background:rgba(255,255,255,.04);color:var(--muted);border:1px solid var(--b2);}
+
+/* TIPO CHECKBOXES */
+.tipo-checks{display:flex;flex-wrap:wrap;gap:8px;padding:10px 0 4px;}
+.tipo-check-lbl{display:flex;align-items:center;gap:6px;font-size:.83rem;color:var(--txt);cursor:pointer;padding:6px 12px;background:var(--bg3);border:1px solid var(--b1);border-radius:4px;transition:all .15s;user-select:none;}
+.tipo-check-lbl:hover{border-color:var(--gold2);}
+.tipo-check-lbl input{accent-color:var(--gold);cursor:pointer;width:14px;height:14px;}
 .empty-state{text-align:center;padding:52px;color:var(--muted);display:none;}
 .empty-state p{font-size:.84rem;margin-top:8px;}
 
@@ -747,7 +797,7 @@ tbody td{padding:13px 15px;font-size:.84rem;vertical-align:middle;}
     <div class="hinner">
       <div class="brand">
         <div class="seal" style="width:30px;height:30px;font-size:13px;margin:0">⚖</div>
-        <span class="brand-name">Reg. Litigantes Maliciosos</span>
+        <span class="brand-name">MALOS MUCHACHOS</span>
       </div>
       <nav>
         <button class="nbtn active" id="nav-archivo" onclick="showSection('archivo')">Archivo</button>
@@ -782,7 +832,7 @@ tbody td{padding:13px 15px;font-size:.84rem;vertical-align:middle;}
         <table>
           <thead>
             <tr>
-              <th>Apellido y Nombre</th><th>CUIL</th><th>Tipo de fraude</th>
+              <th>Apellido y Nombre</th><th>CUIL</th><th>Conducta irregular</th>
               <th>Año</th><th>Jurisdicción</th><th>N° Expediente</th>
               <th id="th-acciones" style="display:none"></th>
             </tr>
@@ -834,7 +884,7 @@ tbody td{padding:13px 15px;font-size:.84rem;vertical-align:middle;}
       <div class="mgrid">
         <div class="mf"><label>CUIL</label><p class="mono" id="m-cuil"></p></div>
         <div class="mf"><label>DNI</label><p class="mono" id="m-dni"></p></div>
-        <div class="mf"><label>Tipo de fraude</label><p id="m-tipo"></p></div>
+        <div class="mf"><label>Conducta irregular</label><p id="m-tipo"></p></div>
         <div class="mf"><label>Año del expediente</label><p id="m-anio"></p></div>
         <div class="mf"><label>N° Expediente</label><p class="mono" id="m-nro"></p></div>
         <div class="mf"><label>Jurisdicción</label><p id="m-jur"></p></div>
@@ -881,13 +931,13 @@ tbody td{padding:13px 15px;font-size:.84rem;vertical-align:middle;}
 
       <div class="form-section-lbl">Datos del expediente</div>
       <div class="form-grid-3">
-        <div class="fg"><label>Tipo de fraude *</label>
-          <select id="e-tipo">
-            <option value="">Seleccionar...</option>
-            <option value="juicio-falso">Juicio laboral fraudulento</option>
-            <option value="testigo-falso">Testigos falsos</option>
-            <option value="ambos">Ambos</option>
-          </select>
+        <div class="fg fg-full"><label>Conducta irregular *</label>
+          <div class="tipo-checks">
+            <label class="tipo-check-lbl"><input type="checkbox" class="tipo-check" value="juicio-falso"> Juicio laboral fraudulento</label>
+            <label class="tipo-check-lbl"><input type="checkbox" class="tipo-check" value="testigo-falso"> Testigos falsos</label>
+            <label class="tipo-check-lbl"><input type="checkbox" class="tipo-check" value="cert-medico"> Certificados médicos falsos</label>
+            <label class="tipo-check-lbl"><input type="checkbox" class="tipo-check" value="robo-laboral"> Robo en ámbito laboral</label>
+          </div>
         </div>
         <div class="fg"><label>Año *</label><input type="number" id="e-anio" placeholder="Ej: 2023" min="1990" max="2099"></div>
         <div class="fg"><label>N° Expediente</label><input type="text" id="e-nro" placeholder="Ej: 12345/2023"></div>
